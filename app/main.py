@@ -79,7 +79,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 停留首末相距 ≥ 30 分钟才形成事件。\n"
             "- 迟到点改变事件时，未变事件保留 event_id；被改变事件按旧号撤回"
             "（retract），新事件以新号加入（upsert）。变更按 `seq` 游标顺序读取。\n"
-            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n\n"
+            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n"
+            "- `GET /vessels/{vessel_id}/voyages` 按船配对跨港相邻停留为航段："
+            "同港相邻不拼接、时间重叠标冲突不生成航程；首次查询返回全库变更"
+            "游标，携带旧游标可在任何上传、撤回或重启后还原历史结果。\n\n"
             "**在 /docs 演示迟到补点与撤回**：展开 `POST /demo/run`，点击 "
             "Try it out -> Execute。响应内含修改前后事件、retract/upsert 变更"
             "及保留编号的事件，可直接观察。"
@@ -89,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"name": "uploads", "description": "CSV 点位上传（原子、幂等）"},
             {"name": "events", "description": "当前现役靠港停留事件"},
             {"name": "changes", "description": "按游标顺序读取的事件变更流"},
+            {"name": "voyages", "description": "按船查询港间航段（可按历史游标还原）"},
             {"name": "demo", "description": "迟到补点与撤回演示"},
             {"name": "system", "description": "健康检查"},
         ],
@@ -346,6 +350,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with db.read_snapshot(conn):
             return service.list_changes(
                 conn, port_code=port_code, after=after, limit=limit
+            )
+
+    @app.get(
+        "/vessels/{vessel_id}/voyages",
+        tags=["voyages"],
+        summary="按船查询港间航段与相邻停留冲突",
+        description=(
+            "把同一艘船跨港区的相邻靠港停留事件配对为港间航段。\n\n"
+            "**游标语义**\n"
+            "- 首次查询不带 `cursor`：返回当前全库事件变更游标（全库单调的 "
+            "`seq`），并在该已提交快照上配对相邻停留。\n"
+            "- 携带此前返回的 `cursor` 重查：从仅追加的变更流重放到该游标，"
+            "原样还原当时的航段与冲突；即使期间发生过跨实例上传、事件撤回或"
+            "服务重启，结果也不变。\n"
+            "- 游标超过当前最新游标（未来游标）返回 422 `cursor_in_future`。\n\n"
+            "**配对规则**（事件按 `(start_time, event_id)` 排序，只配对相邻项）\n"
+            "- 相邻停留位于同一港区：不生成航段，也不跳过该停留与后续的配对。\n"
+            "- 相邻停留时间区间重叠（前者 `end_time` 晚于后者 `start_time`）："
+            "记入 `conflicts`，不生成该段航程。\n"
+            "- 其余跨港相邻停留生成航段，含两端事件编号、港区，以及离港"
+            "（前一停留结束）至进港（后一停留开始）的秒数。"
+        ),
+        responses={
+            200: {"description": "该游标快照下的航段与冲突"},
+            422: {"description": "未来游标或参数校验失败"},
+        },
+    )
+    def read_voyages(
+        vessel_id: str,
+        conn: Db,
+        cursor: int | None = Query(
+            default=None,
+            ge=0,
+            description="此前查询返回的全库变更游标；省略则使用当前最新游标",
+        ),
+    ) -> dict:
+        # Replay and pairing run on one WAL snapshot so the returned cursor and
+        # the reconstructed events describe the same committed state.
+        with db.read_snapshot(conn):
+            return service.list_voyages(
+                conn, vessel_id=vessel_id, cursor=cursor
             )
 
     if resolved.demo_enabled:

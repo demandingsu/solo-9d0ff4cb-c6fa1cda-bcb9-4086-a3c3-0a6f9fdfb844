@@ -24,10 +24,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator
 
-from . import events as event_rules
+from . import events as event_rules, voyages as voyage_rules
 from .csv_ingest import RawPointRow
 from .db import write_transaction
 from .errors import AppError
+
+
+def global_latest_cursor(conn: sqlite3.Connection) -> int:
+    """Highest committed change ``seq`` in the whole database (0 if none)."""
+    row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS s FROM event_changes").fetchone()
+    return int(row["s"])
 
 
 def utc_now_iso() -> str:
@@ -606,3 +612,107 @@ def latest_cursor(conn: sqlite3.Connection, *, port_code: str) -> int:
         (port.id,),
     ).fetchone()
     return int(row["s"])
+
+
+def _replay_vessel_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    vessel_id: str,
+    cursor: int,
+) -> list[dict[str, Any]]:
+    """Rebuild the vessel's active events as of change ``cursor``.
+
+    The change log is append-only: replaying every ``seq <= cursor`` entry for
+    the vessel reproduces exactly the committed snapshot at that point, even
+    after later uploads, retractions or process restarts.  ``retract`` removes
+    the event id and ``upsert`` installs the full event payload carried by the
+    log row, so no other table is involved.
+    """
+    rows = conn.execute(
+        """
+        SELECT seq, change_type, event_id, port_id, vessel_id, start_time,
+               end_time, start_lat_e6, start_lon_e6, end_lat_e6, end_lon_e6,
+               point_count
+        FROM event_changes
+        WHERE vessel_id = ? AND seq <= ?
+        ORDER BY seq
+        """,
+        (vessel_id, cursor),
+    ).fetchall()
+
+    active: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if row["change_type"] == "retract":
+            active.pop(row["event_id"], None)
+        else:
+            active[row["event_id"]] = {
+                "event_id": row["event_id"],
+                "port_id": row["port_id"],
+                "vessel_id": row["vessel_id"],
+                "start_time": row["start_time"],
+                "end_time": row["end_time"],
+                "point_count": row["point_count"],
+            }
+    return list(active.values())
+
+
+def list_voyages(
+    conn: sqlite3.Connection,
+    *,
+    vessel_id: str,
+    cursor: int | None,
+) -> dict[str, Any]:
+    """Return inter-port voyages and pairing conflicts for one vessel.
+
+    With ``cursor is None`` the current whole-database change cursor is used
+    and returned, so a first query establishes the snapshot boundary.  A
+    supplied cursor must be <= the current global cursor; future cursors are
+    rejected rather than silently returning the present state.
+    """
+    current_cursor = global_latest_cursor(conn)
+    if cursor is None:
+        effective_cursor = current_cursor
+    else:
+        if cursor > current_cursor:
+            raise AppError(
+                422,
+                "cursor_in_future",
+                (
+                    f"cursor {cursor} is ahead of the latest committed change "
+                    f"({current_cursor})"
+                ),
+                {"cursor": cursor, "latest_cursor": current_cursor},
+            )
+        effective_cursor = cursor
+
+    snapshot = _replay_vessel_snapshot(
+        conn, vessel_id=vessel_id, cursor=effective_cursor
+    )
+
+    port_rows = conn.execute("SELECT id, code FROM ports").fetchall()
+    port_code_by_id = {row["id"]: row["code"] for row in port_rows}
+    # Every port referenced by a surviving change row still exists; a missing
+    # entry would mean history was tampered with rather than normally retracted.
+    missing = {
+        event["port_id"]
+        for event in snapshot
+        if event["port_id"] not in port_code_by_id
+    }
+    if missing:
+        raise RuntimeError(
+            f"change log references deleted port ids: {sorted(missing)}"
+        )
+
+    voyage_list, conflict_list = voyage_rules.build_voyages(
+        snapshot, port_code_by_id
+    )
+    return {
+        "vessel_id": vessel_id,
+        "cursor": effective_cursor,
+        "latest_cursor": current_cursor,
+        "snapshot_event_count": len(snapshot),
+        "voyages": [voyage_rules.voyage_dict(item) for item in voyage_list],
+        "conflicts": [
+            voyage_rules.conflict_dict(item) for item in conflict_list
+        ],
+    }

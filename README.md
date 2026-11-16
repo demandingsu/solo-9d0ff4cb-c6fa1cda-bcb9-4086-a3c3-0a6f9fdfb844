@@ -37,6 +37,10 @@ docker compose -f docker-compose.dual.yml up --build
 | 出港点断开 | 矩形外的点作为退出标记，关闭当前事件且不并入 |
 | 迟到点改变事件 | 未变事件保留 `event_id`；被改变事件旧号 retract + 新号 upsert |
 | 游标顺序读取变更 | `GET /ports/{code}/changes?after=<seq>`，严格递增、可续读 |
+| 按船查询港间航段 | `GET /vessels/{vessel_id}/voyages`，全库游标快照可历史还原 |
+| 同港相邻不拼接 | 同港区相邻停留不生成航段，也不跳过后再拼接 |
+| 时间重叠标冲突 | 相邻停留时间区间重叠时记入 `conflicts`，不生成该段航程 |
+| 历史游标可重放 | 变更流仅追加；携带旧游标重查还原当时航段，未来游标 422 |
 | 上传原子生效 | 原始点、现役事件、变更记录同一 `BEGIN IMMEDIATE` 事务提交 |
 | 两实例交错上传不丢更新 | SQLite WAL + `BEGIN IMMEDIATE` 写串行化 |
 | 失败不推进游标 | 事务回滚，`seq` 不前进，无半批结果 |
@@ -71,6 +75,7 @@ epoch 秒/毫秒。坐标按 1e-6 度取整后比较。上传上限默认 10 MiB
 | POST | `/ports/{code}/uploads` | 上传 CSV 点位，整批原子生效 |
 | GET | `/ports/{code}/events` | 现役事件，按 `event_id` 分页 |
 | GET | `/ports/{code}/changes` | 变更流，`after` 游标 + `limit` |
+| GET | `/vessels/{vessel_id}/voyages` | 按船查询港间航段与冲突，支持历史游标还原 |
 | POST | `/demo/run` | 迟到补点 / retract 演示（`AIS_DEMO_ENABLED=1`） |
 | GET | `/healthz` | 健康检查 |
 
@@ -106,6 +111,53 @@ epoch 秒/毫秒。坐标按 1e-6 度取整后比较。上传上限默认 10 MiB
 `seq` 在全库单调递增，同一港区的游标可能不连续；按 `seq > after` 读取即可。
 `GET /events` 返回的 `cursor` 与变更流同源，可用于「先快照、后增量」。
 
+## 港间航段（排放核算）
+
+`GET /vessels/{vessel_id}/voyages` 把同一艘船在各港区的停留事件配对成航段。
+
+**游标语义（历史可还原）**
+
+* 首次查询不带 `cursor`：返回当前**全库**事件变更游标，并在该已提交快照上
+  配对。保存响应中的 `cursor` 即保存了这次结果的版本。
+* 携带旧 `cursor` 重查：服务端从仅追加的 `event_changes` 变更流重放该船
+  `seq <= cursor` 的全部 `upsert/retract`，重建当时的现役事件后再配对。
+  因此即使期间发生过跨实例上传、事件撤回（retract）或服务重启，旧结果都能
+  原样还原，不依赖任何易失内存状态。
+* 游标超过当前最新 `seq` 视为「未来游标」，返回 422 `cursor_in_future`，
+  避免把当前状态误当作历史结果。
+
+**配对规则**（事件按 `(start_time, event_id)` 排序，只看相邻两项）
+
+1. 时间区间重叠（`first.end_time > second.start_time`）：记入 `conflicts`
+   （`reason=overlapping_stays`，同港重叠为 `same_port_overlap`），不生成航段。
+2. 同港区且不重叠：不生成航段；该停留仍继续与下一项配对，不会被跳过。
+3. 跨港区且不重叠：生成航段，含两端事件编号、港区编号与代码，以及离港
+   （前一停留 `end_time`）至进港（后一停留 `start_time`）的 `sailing_seconds`。
+
+响应示例：
+
+```json
+{
+  "vessel_id": "MV-1",
+  "cursor": 2,
+  "latest_cursor": 4,
+  "snapshot_event_count": 2,
+  "voyages": [
+    {
+      "order": 1,
+      "departure": {"event_id": 1, "port_id": 1, "port_code": "CNSHA-PD",
+                    "start_time": 1767225600, "end_time": 1767227400},
+      "arrival":   {"event_id": 2, "port_id": 2, "port_code": "CNNING-ZJ",
+                    "start_time": 1767236400, "end_time": 1767238200},
+      "sailing_seconds": 9000
+    }
+  ],
+  "conflicts": []
+}
+```
+
+时间均为 UTC epoch 秒。未出现过的船返回空 `voyages`/`conflicts`（200，非 404）。
+
 ## 本地开发与测试
 
 ```bash
@@ -116,7 +168,10 @@ AIS_DEMO_ENABLED=1 uvicorn app.main:app --reload
 
 测试覆盖：10 分钟/30 分钟边界、出港断开、批内与库内去重、异坐标整批回滚、
 迟到点 retract/upsert 与编号保留、两事件合并、幂等重放、游标分页、港区隔离、
-双实例（共享 DB 的并发线程与两个 FastAPI 实例）交错上传。`docker build`
+双实例（共享 DB 的并发线程与两个 FastAPI 实例）交错上传；航段配对规则（跨港
+成段、同港不拼接、重叠冲突、边界相接、确定性排序）的纯函数单测，以及首次查询
+游标、旧游标重放（迟到补点、retract、重启、跨实例上传后仍还原）、未来游标 422、
+船舶隔离与空船的 API 测试。`docker build`
 未能在本环境执行（无 Docker 守护进程），Compose 文件仅做了 YAML 解析校验。
 
 ## 配置
